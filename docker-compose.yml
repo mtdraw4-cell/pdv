@@ -1,0 +1,234 @@
+# 🟢🟡 Mechama PDV - Docker Compose
+# Sistema PDV + ERP para Microempreendedores Brasileiros
+
+version: '3.8'
+
+services:
+  # ============================================
+  # PostgreSQL - Banco de Dados
+  # ============================================
+  db:
+    image: postgres:15-alpine
+    container_name: mechama-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mechama
+      POSTGRES_PASSWORD: mechama123
+      POSTGRES_DB: mechama_pdv
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/app/models/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mechama -d mechama_pdv"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mechama-network
+
+  # ============================================
+  # Redis - Cache e Filas
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: mechama-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mechama-network
+
+  # ============================================
+  # Backend - FastAPI
+  # ============================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mechama-backend
+    restart: unless-stopped
+    environment:
+      DEBUG: "false"
+      SECRET_KEY: ${SECRET_KEY:-mechama-pdv-secret-key-change-in-production}
+      DATABASE_URL: postgresql+asyncpg://mechama:mechama123@db:5432/mechama_pdv
+      DATABASE_URL_SYNC: postgresql://mechama:mechama123@db:5432/mechama_pdv
+      REDIS_URL: redis://redis:6379/0
+      MERCADO_PAGO_ACCESS_TOKEN: ${MERCADO_PAGO_ACCESS_TOKEN:-}
+      EVOLUTION_API_URL: http://evolution-api:8080
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY:-}
+      CORS_ORIGINS: '["http://localhost:5173", "http://localhost:3000"]'
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - uploads_data:/app/uploads
+    networks:
+      - mechama-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================
+  # Frontend - React (Desenvolvimento)
+  # ============================================
+  frontend:
+    image: node:20-alpine
+    container_name: mechama-frontend
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_URL: http://localhost:8000/api/v1
+    depends_on:
+      - backend
+    networks:
+      - mechama-network
+
+  # ============================================
+  # Nginx - Produção (Frontend + Proxy Reverso)
+  # ============================================
+  nginx:
+    image: nginx:alpine
+    container_name: mechama-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro
+      # - ./frontend/dist:/usr/share/nginx/html:ro  # Descomente para produção
+    depends_on:
+      - backend
+    networks:
+      - mechama-network
+    profiles:
+      - producao
+
+  # ============================================
+  # Evolution API - WhatsApp (Opcional)
+  # ============================================
+  evolution-api:
+    image: atendai/evolution-api:latest
+    container_name: mechama-evolution
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_URL: http://localhost:8080
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY:-mechama-evolution-key}
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://mechama:mechama123@db:5432/mechama_pdv
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      DATABASE_SAVE_DATA_LABELS: "true"
+      DATABASE_SAVE_DATA_HISTORIC: "true"
+      REDIS_ENABLED: "true"
+      REDIS_URI: redis://redis:6379/0
+      REDIS_PREFIX_KEY: evolution
+      WEBHOOK_GLOBAL_ENABLED: "true"
+      WEBHOOK_GLOBAL_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_EVENTS_APPLICATION_STARTUP: "false"
+      WEBHOOK_EVENTS_QRCODE_UPDATED: "true"
+      WEBHOOK_EVENTS_MESSAGES_SET: "true"
+      WEBHOOK_EVENTS_MESSAGES_UPSERT: "true"
+      WEBHOOK_EVENTS_MESSAGES_UPDATE: "true"
+      WEBHOOK_EVENTS_SEND_MESSAGE: "true"
+      WEBHOOK_EVENTS_CONTACTS_SET: "true"
+      WEBHOOK_EVENTS_CONTACTS_UPSERT: "true"
+      WEBHOOK_EVENTS_CONTACTS_UPDATE: "true"
+      WEBHOOK_EVENTS_PRESENCE_UPDATE: "true"
+      WEBHOOK_EVENTS_CHATS_SET: "true"
+      WEBHOOK_EVENTS_CHATS_UPSERT: "true"
+      WEBHOOK_EVENTS_CHATS_UPDATE: "true"
+      WEBHOOK_EVENTS_CONNECTION_UPDATE: "true"
+      WEBHOOK_EVENTS_LABELS_EDIT: "true"
+      WEBHOOK_EVENTS_LABELS_ASSOCIATION: "true"
+      WEBHOOK_EVENTS_CALL: "true"
+      WEBHOOK_EVENTS_TYPEBOT_START: "false"
+      WEBHOOK_EVENTS_TYPEBOT_CHANGE_STATUS: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mechama-network
+    profiles:
+      - completo
+      - whatsapp
+
+  # ============================================
+  # Backup Automático (Opcional)
+  # ============================================
+  backup:
+    image: postgres:15-alpine
+    container_name: mechama-backup
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mechama
+      POSTGRES_PASSWORD: mechama123
+      POSTGRES_DB: mechama_pdv
+      BACKUP_RETENTION_DAYS: "7"
+    command: >
+      sh -c '
+        while true; do
+          sleep 86400
+          echo "Iniciando backup..."
+          pg_dump -h db -U mechama mechama_pdv > /backup/mechama_pdv_$$(date +%Y%m%d_%H%M%S).sql
+          find /backup -name "*.sql" -mtime +$$BACKUP_RETENTION_DAYS -delete
+          echo "Backup concluído!"
+        done
+      '
+    volumes:
+      - backup_data:/backup
+    depends_on:
+      - db
+    networks:
+      - mechama-network
+    profiles:
+      - backup
+
+# ============================================
+# Volumes
+# ============================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  uploads_data:
+    driver: local
+  backup_data:
+    driver: local
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  mechama-network:
+    driver: bridge
